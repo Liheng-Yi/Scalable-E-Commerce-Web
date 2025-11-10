@@ -1,0 +1,1 @@
+{"Modules":[{"Key":"","Source":"","Dir":"."},{"Key":"ecr","Source":"./modules/ecr","Dir":"modules/ecr"},{"Key":"ecs","Source":"./modules/ecs","Dir":"modules/ecs"},{"Key":"logging","Source":"./modules/logging","Dir":"modules/logging"},{"Key":"network","Source":"./modules/network","Dir":"modules/network"}]}

@@ -1,0 +1,15 @@
+# Exclude Terraform files from Docker build context
+terraform/
+
+# Exclude documentation
+*.md
+
+# Exclude test files
+test_api_simple.sh
+Product_API.postman_collection.json
+POSTMAN_TESTING_GUIDE.md
+
+# Exclude Git
+.git/
+.gitignore
+

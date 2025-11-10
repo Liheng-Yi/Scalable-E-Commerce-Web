@@ -1,0 +1,21 @@
+# Example terraform.tfvars file
+# Copy this to terraform.tfvars and customize as needed
+
+# AWS Region - change if you want to deploy to a different region
+aws_region = "us-west-2"
+
+# ECR Repository Name - must be unique in your AWS account
+ecr_repository_name = "ecr_service"
+
+# Service Name - used as prefix for all resources
+service_name = "CS6650L2"
+
+# Container Port - must match your application's port
+container_port = 8080
+
+# Number of ECS Fargate tasks to run
+ecs_count = 1
+
+# CloudWatch log retention in days
+log_retention_days = 7
+
