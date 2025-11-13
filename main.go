@@ -35,13 +35,8 @@ type SearchResponse struct {
 var productStore sync.Map
 var productIDs []int // Keep track of all product IDs for iteration
 
-// Memory leak storage - this will grow indefinitely!
-var memoryLeakStorage [][]byte
-var leakMutex sync.Mutex
-
 // Stats for tracking
 var totalRequestsProcessed int64
-var totalMemoryLeaked int64
 
 // Sample data for variety
 var brands = []string{"Alpha", "Beta", "Gamma", "Delta", "Epsilon", "Zeta", "Eta", "Theta"}
@@ -76,33 +71,11 @@ func initializeProducts() {
 
 // searchProducts performs bounded iteration search
 // Critical: Checks EXACTLY 100 products, not all 100,000
-// 🔥 WARNING: THIS VERSION HAS A MEMORY LEAK! 🔥
 func searchProducts(w http.ResponseWriter, r *http.Request) {
 	startTime := time.Now()
 	
-	// 🔥 MEMORY LEAK: Allocate memory that never gets freed!
-	// Each request leaks 10MB of memory
-	leakSize := 10 * 1024 * 1024 // 10MB per request
-	leak := make([]byte, leakSize)
-	
-	for i := 0; i < len(leak); i += 1024 {
-		leak[i] = byte(i % 256)
-	}
-	
-	// Store in global variable - this prevents garbage collection!
-	leakMutex.Lock()
-	memoryLeakStorage = append(memoryLeakStorage, leak)
-	atomic.AddInt64(&totalMemoryLeaked, int64(leakSize))
+	// Track request count
 	atomic.AddInt64(&totalRequestsProcessed, 1)
-	currentLeaks := len(memoryLeakStorage)
-	leakMutex.Unlock()
-	
-	// Log every 10 requests to avoid spam
-	if currentLeaks % 10 == 0 {
-		log.Printf("💧💧💧 MEMORY LEAK ALERT! Total: %d slices, ~%d MB leaked", 
-			currentLeaks, 
-			totalMemoryLeaked/1024/1024)
-	}
 	
 	// Get search query
 	query := strings.ToLower(r.URL.Query().Get("q"))
@@ -217,14 +190,10 @@ func statsEndpoint(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
-// memoryStatsEndpoint shows current memory usage - critical for demonstrating the leak!
+// memoryStatsEndpoint shows current memory usage
 func memoryStatsEndpoint(w http.ResponseWriter, r *http.Request) {
 	var m runtime.MemStats
 	runtime.ReadMemStats(&m)
-	
-	leakMutex.Lock()
-	leakedSlices := len(memoryLeakStorage)
-	leakMutex.Unlock()
 	
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusOK)
@@ -233,8 +202,6 @@ func memoryStatsEndpoint(w http.ResponseWriter, r *http.Request) {
 		"total_alloc_mb":     m.TotalAlloc / 1024 / 1024,
 		"sys_mb":             m.Sys / 1024 / 1024,
 		"num_gc":             m.NumGC,
-		"leaked_slices":      leakedSlices,
-		"leaked_mb_approx":   totalMemoryLeaked / 1024 / 1024,
 		"requests_processed": totalRequestsProcessed,
 	})
 }
@@ -251,7 +218,7 @@ func main() {
 	// Health check and stats endpoints
 	router.HandleFunc("/health", healthCheck).Methods("GET")
 	router.HandleFunc("/stats", statsEndpoint).Methods("GET")
-	router.HandleFunc("/memory", memoryStatsEndpoint).Methods("GET")  // 👈 ADD THIS LINE
+	router.HandleFunc("/memory", memoryStatsEndpoint).Methods("GET")
 
 	port := ":8080"
 	log.Printf("🚀 Starting server on port %s...", port)
