@@ -20,6 +20,7 @@ import (
 	"github.com/aws/aws-sdk-go-v2/service/dynamodb"
 	"github.com/aws/aws-sdk-go-v2/service/dynamodb/types"
 	"github.com/gorilla/mux"
+	"github.com/redis/go-redis/v9"
 )
 
 // Product represents a product with searchable fields
@@ -72,13 +73,30 @@ type Order struct {
 	CreatedAt string     `json:"created_at" dynamodbav:"created_at"`
 }
 
+// CompareResponse shows latency comparison between Redis and in-memory
+type CompareResponse struct {
+	ProductID     int     `json:"product_id"`
+	Product       Product `json:"product"`
+	RedisLatency  string  `json:"redis_latency"`
+	MemoryLatency string  `json:"memory_latency"`
+	CacheHit      bool    `json:"cache_hit"`
+	SpeedupFactor float64 `json:"speedup_factor,omitempty"`
+}
+
 // DynamoDB client and table names
 var (
-	dynamoClient       *dynamodb.Client
-	productsTableName  string
-	cartsTableName     string
-	ordersTableName    string
-	useDynamoDB        bool
+	dynamoClient      *dynamodb.Client
+	productsTableName string
+	cartsTableName    string
+	ordersTableName   string
+	useDynamoDB       bool
+)
+
+// Redis client
+var (
+	redisClient  *redis.Client
+	redisEnabled bool
+	redisEndpoint string
 )
 
 // In-memory product store for fast search (100k products)
@@ -95,26 +113,66 @@ var totalReadOperations int64
 var totalWriteOperations int64
 var totalDynamoDBReads int64
 var totalDynamoDBWrites int64
+var totalRedisHits int64
+var totalRedisMisses int64
+var totalRedisWrites int64
+
+// Hot product cache key prefix
+const hotProductKeyPrefix = "hot:product:"
+const hotProductTTL = 5 * time.Minute
 
 // Sample data for variety
 var brands = []string{"Alpha", "Beta", "Gamma", "Delta", "Epsilon", "Zeta", "Eta", "Theta"}
 var categories = []string{"Electronics", "Books", "Home", "Sports", "Fashion", "Toys", "Garden", "Automotive"}
 
+// initRedis initializes the Redis client
+func initRedis() {
+	redisEndpoint = os.Getenv("REDIS_ENDPOINT")
+	
+	if redisEndpoint == "" {
+		log.Println("⚠️  Redis endpoint not configured, hot product caching disabled")
+		redisEnabled = false
+		return
+	}
+	
+	redisClient = redis.NewClient(&redis.Options{
+		Addr:         redisEndpoint,
+		Password:     "", // No password for ElastiCache
+		DB:           0,
+		DialTimeout:  5 * time.Second,
+		ReadTimeout:  3 * time.Second,
+		WriteTimeout: 3 * time.Second,
+		PoolSize:     10,
+	})
+	
+	// Test connection
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	
+	_, err := redisClient.Ping(ctx).Result()
+	if err != nil {
+		log.Printf("⚠️  Failed to connect to Redis: %v, hot product caching disabled", err)
+		redisEnabled = false
+		return
+	}
+	
+	redisEnabled = true
+	log.Println("✅ Redis client initialized successfully")
+	log.Printf("   Redis Endpoint: %s", redisEndpoint)
+}
+
 // initDynamoDB initializes the DynamoDB client
 func initDynamoDB() {
-	// Get table names from environment variables
 	productsTableName = os.Getenv("DYNAMODB_PRODUCTS_TABLE")
 	cartsTableName = os.Getenv("DYNAMODB_CARTS_TABLE")
 	ordersTableName = os.Getenv("DYNAMODB_ORDERS_TABLE")
 	
-	// Check if DynamoDB tables are configured
 	if cartsTableName == "" || ordersTableName == "" {
 		log.Println("⚠️  DynamoDB tables not configured, using in-memory storage")
 		useDynamoDB = false
 		return
 	}
 	
-	// Load AWS configuration
 	cfg, err := config.LoadDefaultConfig(context.TODO())
 	if err != nil {
 		log.Printf("⚠️  Failed to load AWS config: %v, using in-memory storage", err)
@@ -130,7 +188,7 @@ func initDynamoDB() {
 	log.Printf("   Orders Table: %s", ordersTableName)
 }
 
-// initializeProducts generates 100,000 products at startup (in-memory for fast search)
+// initializeProducts generates 100,000 products at startup
 func initializeProducts() {
 	log.Println("Generating 100,000 products...")
 	start := time.Now()
@@ -158,9 +216,91 @@ func initializeProducts() {
 	log.Printf("✅ Generated 100,000 products in %s", elapsed)
 }
 
+// Redis Helper Functions
+
+// cacheHotProduct caches a product in Redis
+func cacheHotProduct(ctx context.Context, product Product) error {
+	if !redisEnabled {
+		return nil
+	}
+	
+	atomic.AddInt64(&totalRedisWrites, 1)
+	
+	data, err := json.Marshal(product)
+	if err != nil {
+		return fmt.Errorf("failed to marshal product: %w", err)
+	}
+	
+	key := fmt.Sprintf("%s%d", hotProductKeyPrefix, product.ID)
+	return redisClient.Set(ctx, key, data, hotProductTTL).Err()
+}
+
+// getHotProduct retrieves a product from Redis cache
+func getHotProduct(ctx context.Context, productID int) (*Product, error) {
+	if !redisEnabled {
+		return nil, nil
+	}
+	
+	key := fmt.Sprintf("%s%d", hotProductKeyPrefix, productID)
+	data, err := redisClient.Get(ctx, key).Bytes()
+	if err == redis.Nil {
+		atomic.AddInt64(&totalRedisMisses, 1)
+		return nil, nil // Cache miss
+	}
+	if err != nil {
+		return nil, fmt.Errorf("redis get error: %w", err)
+	}
+	
+	atomic.AddInt64(&totalRedisHits, 1)
+	
+	var product Product
+	if err := json.Unmarshal(data, &product); err != nil {
+		return nil, fmt.Errorf("failed to unmarshal product: %w", err)
+	}
+	
+	return &product, nil
+}
+
+// getAllHotProducts retrieves all hot products from Redis
+func getAllHotProducts(ctx context.Context) ([]Product, error) {
+	if !redisEnabled {
+		return nil, nil
+	}
+	
+	// Find all hot product keys
+	pattern := hotProductKeyPrefix + "*"
+	keys, err := redisClient.Keys(ctx, pattern).Result()
+	if err != nil {
+		return nil, fmt.Errorf("failed to get hot product keys: %w", err)
+	}
+	
+	if len(keys) == 0 {
+		return []Product{}, nil
+	}
+	
+	// Get all products
+	values, err := redisClient.MGet(ctx, keys...).Result()
+	if err != nil {
+		return nil, fmt.Errorf("failed to get hot products: %w", err)
+	}
+	
+	products := make([]Product, 0, len(values))
+	for _, val := range values {
+		if val == nil {
+			continue
+		}
+		var product Product
+		if err := json.Unmarshal([]byte(val.(string)), &product); err != nil {
+			continue
+		}
+		products = append(products, product)
+	}
+	
+	return products, nil
+}
+
 // DynamoDB Helper Functions
 
-// getCartFromDynamoDB retrieves a cart from DynamoDB
 func getCartFromDynamoDB(ctx context.Context, userID string) (*Cart, error) {
 	atomic.AddInt64(&totalDynamoDBReads, 1)
 	
@@ -175,7 +315,7 @@ func getCartFromDynamoDB(ctx context.Context, userID string) (*Cart, error) {
 	}
 	
 	if result.Item == nil {
-		return nil, nil // Cart not found
+		return nil, nil
 	}
 	
 	var cart Cart
@@ -186,11 +326,9 @@ func getCartFromDynamoDB(ctx context.Context, userID string) (*Cart, error) {
 	return &cart, nil
 }
 
-// saveCartToDynamoDB saves a cart to DynamoDB
 func saveCartToDynamoDB(ctx context.Context, cart *Cart) error {
 	atomic.AddInt64(&totalDynamoDBWrites, 1)
 	
-	// Set TTL for 7 days (abandoned cart cleanup)
 	cart.TTL = time.Now().Add(7 * 24 * time.Hour).Unix()
 	cart.UpdatedAt = time.Now().Format(time.RFC3339)
 	
@@ -210,7 +348,6 @@ func saveCartToDynamoDB(ctx context.Context, cart *Cart) error {
 	return nil
 }
 
-// deleteCartFromDynamoDB removes a cart from DynamoDB
 func deleteCartFromDynamoDB(ctx context.Context, userID string) error {
 	atomic.AddInt64(&totalDynamoDBWrites, 1)
 	
@@ -223,7 +360,6 @@ func deleteCartFromDynamoDB(ctx context.Context, userID string) error {
 	return err
 }
 
-// saveOrderToDynamoDB saves an order to DynamoDB
 func saveOrderToDynamoDB(ctx context.Context, order *Order) error {
 	atomic.AddInt64(&totalDynamoDBWrites, 1)
 	
@@ -243,7 +379,6 @@ func saveOrderToDynamoDB(ctx context.Context, order *Order) error {
 	return nil
 }
 
-// getOrderFromDynamoDB retrieves an order from DynamoDB
 func getOrderFromDynamoDB(ctx context.Context, orderID string) (*Order, error) {
 	atomic.AddInt64(&totalDynamoDBReads, 1)
 	
@@ -271,7 +406,7 @@ func getOrderFromDynamoDB(ctx context.Context, orderID string) (*Order, error) {
 
 // HTTP Handlers
 
-// searchProducts performs bounded iteration search (READ operation)
+// searchProducts performs bounded iteration search
 func searchProducts(w http.ResponseWriter, r *http.Request) {
 	startTime := time.Now()
 	
@@ -333,6 +468,159 @@ func searchProducts(w http.ResponseWriter, r *http.Request) {
 	json.NewEncoder(w).Encode(response)
 }
 
+// getHotProducts returns all cached hot products from Redis
+func getHotProducts(w http.ResponseWriter, r *http.Request) {
+	atomic.AddInt64(&totalReadOperations, 1)
+	
+	if !redisEnabled {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusServiceUnavailable)
+		json.NewEncoder(w).Encode(map[string]string{
+			"error": "Redis not enabled",
+			"hint":  "Set REDIS_ENDPOINT environment variable",
+		})
+		return
+	}
+	
+	startTime := time.Now()
+	products, err := getAllHotProducts(r.Context())
+	elapsed := time.Since(startTime)
+	
+	if err != nil {
+		log.Printf("Error getting hot products: %v", err)
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusInternalServerError)
+		json.NewEncoder(w).Encode(map[string]string{"error": "Failed to get hot products"})
+		return
+	}
+	
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusOK)
+	json.NewEncoder(w).Encode(map[string]interface{}{
+		"hot_products": products,
+		"count":        len(products),
+		"latency":      fmt.Sprintf("%.3fms", float64(elapsed.Microseconds())/1000),
+		"source":       "redis",
+	})
+}
+
+// markProductHot caches a product as "hot" in Redis
+func markProductHot(w http.ResponseWriter, r *http.Request) {
+	atomic.AddInt64(&totalWriteOperations, 1)
+	
+	vars := mux.Vars(r)
+	productID := vars["id"]
+	
+	id, err := strconv.Atoi(productID)
+	if err != nil {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusBadRequest)
+		json.NewEncoder(w).Encode(map[string]string{"error": "Invalid product ID"})
+		return
+	}
+	
+	// Get product from in-memory store
+	val, ok := productStore.Load(id)
+	if !ok {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusNotFound)
+		json.NewEncoder(w).Encode(map[string]string{"error": "Product not found"})
+		return
+	}
+	product := val.(Product)
+	
+	if !redisEnabled {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusServiceUnavailable)
+		json.NewEncoder(w).Encode(map[string]string{
+			"error": "Redis not enabled",
+			"hint":  "Set REDIS_ENDPOINT environment variable",
+		})
+		return
+	}
+	
+	// Cache in Redis
+	if err := cacheHotProduct(r.Context(), product); err != nil {
+		log.Printf("Error caching hot product: %v", err)
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusInternalServerError)
+		json.NewEncoder(w).Encode(map[string]string{"error": "Failed to cache product"})
+		return
+	}
+	
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusOK)
+	json.NewEncoder(w).Encode(map[string]interface{}{
+		"message":    "Product marked as hot",
+		"product_id": id,
+		"ttl":        hotProductTTL.String(),
+		"cached_in":  "redis",
+	})
+}
+
+// compareProductLatency compares Redis vs in-memory latency for a product
+func compareProductLatency(w http.ResponseWriter, r *http.Request) {
+	atomic.AddInt64(&totalReadOperations, 1)
+	
+	vars := mux.Vars(r)
+	productID := vars["id"]
+	
+	id, err := strconv.Atoi(productID)
+	if err != nil {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusBadRequest)
+		json.NewEncoder(w).Encode(map[string]string{"error": "Invalid product ID"})
+		return
+	}
+	
+	// Measure in-memory latency
+	memStart := time.Now()
+	val, ok := productStore.Load(id)
+	memLatency := time.Since(memStart)
+	
+	if !ok {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusNotFound)
+		json.NewEncoder(w).Encode(map[string]string{"error": "Product not found"})
+		return
+	}
+	product := val.(Product)
+	
+	// Measure Redis latency
+	var redisLatency time.Duration
+	var cacheHit bool
+	
+	if redisEnabled {
+		redisStart := time.Now()
+		cachedProduct, err := getHotProduct(r.Context(), id)
+		redisLatency = time.Since(redisStart)
+		
+		if err == nil && cachedProduct != nil {
+			cacheHit = true
+		}
+	}
+	
+	response := CompareResponse{
+		ProductID:     id,
+		Product:       product,
+		MemoryLatency: fmt.Sprintf("%.3fms", float64(memLatency.Microseconds())/1000),
+		CacheHit:      cacheHit,
+	}
+	
+	if redisEnabled {
+		response.RedisLatency = fmt.Sprintf("%.3fms", float64(redisLatency.Microseconds())/1000)
+		if memLatency > 0 && redisLatency > 0 {
+			response.SpeedupFactor = float64(memLatency) / float64(redisLatency)
+		}
+	} else {
+		response.RedisLatency = "N/A (Redis disabled)"
+	}
+	
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusOK)
+	json.NewEncoder(w).Encode(response)
+}
+
 // healthCheck handles health check with memory threshold monitoring
 func healthCheck(w http.ResponseWriter, r *http.Request) {
 	var m runtime.MemStats
@@ -358,13 +646,14 @@ func healthCheck(w http.ResponseWriter, r *http.Request) {
 	
 	w.WriteHeader(http.StatusOK)
 	json.NewEncoder(w).Encode(map[string]interface{}{
-		"status":       "healthy",
-		"memory_mb":    memoryMB,
-		"dynamodb":     useDynamoDB,
+		"status":    "healthy",
+		"memory_mb": memoryMB,
+		"dynamodb":  useDynamoDB,
+		"redis":     redisEnabled,
 	})
 }
 
-// statsEndpoint shows how many products are in memory
+// statsEndpoint shows system statistics
 func statsEndpoint(w http.ResponseWriter, r *http.Request) {
 	count := 0
 	productStore.Range(func(key, value interface{}) bool {
@@ -375,16 +664,18 @@ func statsEndpoint(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusOK)
 	json.NewEncoder(w).Encode(map[string]interface{}{
-		"total_products":     count,
-		"memory_footprint":   "~100,000 products",
-		"dynamodb_enabled":   useDynamoDB,
-		"products_table":     productsTableName,
-		"carts_table":        cartsTableName,
-		"orders_table":       ordersTableName,
+		"total_products":   count,
+		"memory_footprint": "~100,000 products",
+		"dynamodb_enabled": useDynamoDB,
+		"redis_enabled":    redisEnabled,
+		"redis_endpoint":   redisEndpoint,
+		"products_table":   productsTableName,
+		"carts_table":      cartsTableName,
+		"orders_table":     ordersTableName,
 	})
 }
 
-// memoryStatsEndpoint shows current memory usage
+// memoryStatsEndpoint shows current memory and operation stats
 func memoryStatsEndpoint(w http.ResponseWriter, r *http.Request) {
 	var m runtime.MemStats
 	runtime.ReadMemStats(&m)
@@ -392,19 +683,22 @@ func memoryStatsEndpoint(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusOK)
 	json.NewEncoder(w).Encode(map[string]interface{}{
-		"alloc_mb":            m.Alloc / 1024 / 1024,
-		"total_alloc_mb":      m.TotalAlloc / 1024 / 1024,
-		"sys_mb":              m.Sys / 1024 / 1024,
-		"num_gc":              m.NumGC,
-		"requests_processed":  totalRequestsProcessed,
-		"read_operations":     totalReadOperations,
-		"write_operations":    totalWriteOperations,
-		"dynamodb_reads":      totalDynamoDBReads,
-		"dynamodb_writes":     totalDynamoDBWrites,
+		"alloc_mb":           m.Alloc / 1024 / 1024,
+		"total_alloc_mb":     m.TotalAlloc / 1024 / 1024,
+		"sys_mb":             m.Sys / 1024 / 1024,
+		"num_gc":             m.NumGC,
+		"requests_processed": totalRequestsProcessed,
+		"read_operations":    totalReadOperations,
+		"write_operations":   totalWriteOperations,
+		"dynamodb_reads":     totalDynamoDBReads,
+		"dynamodb_writes":    totalDynamoDBWrites,
+		"redis_hits":         totalRedisHits,
+		"redis_misses":       totalRedisMisses,
+		"redis_writes":       totalRedisWrites,
 	})
 }
 
-// getProduct retrieves a single product by ID (from in-memory store)
+// getProduct retrieves a single product by ID
 func getProduct(w http.ResponseWriter, r *http.Request) {
 	atomic.AddInt64(&totalReadOperations, 1)
 	
@@ -420,9 +714,22 @@ func getProduct(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	
+	// Try Redis cache first (for hot products)
+	if redisEnabled {
+		if cachedProduct, err := getHotProduct(r.Context(), id); err == nil && cachedProduct != nil {
+			w.Header().Set("Content-Type", "application/json")
+			w.Header().Set("X-Cache", "HIT")
+			w.WriteHeader(http.StatusOK)
+			json.NewEncoder(w).Encode(cachedProduct)
+			return
+		}
+	}
+	
+	// Fallback to in-memory store
 	if val, ok := productStore.Load(id); ok {
 		product := val.(Product)
 		w.Header().Set("Content-Type", "application/json")
+		w.Header().Set("X-Cache", "MISS")
 		w.WriteHeader(http.StatusOK)
 		json.NewEncoder(w).Encode(product)
 	} else {
@@ -432,7 +739,7 @@ func getProduct(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
-// getCart retrieves user's cart (from DynamoDB or in-memory)
+// getCart retrieves user's cart
 func getCart(w http.ResponseWriter, r *http.Request) {
 	atomic.AddInt64(&totalReadOperations, 1)
 	
@@ -452,7 +759,6 @@ func getCart(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	} else {
-		// Fallback to in-memory
 		if val, ok := cartStore.Load(userID); ok {
 			c := val.(Cart)
 			cart = &c
@@ -460,7 +766,6 @@ func getCart(w http.ResponseWriter, r *http.Request) {
 	}
 	
 	if cart == nil {
-		// Return empty cart
 		cart = &Cart{
 			UserID:    userID,
 			Items:     []CartItem{},
@@ -474,7 +779,7 @@ func getCart(w http.ResponseWriter, r *http.Request) {
 	json.NewEncoder(w).Encode(cart)
 }
 
-// addToCart adds an item to cart (DynamoDB or in-memory)
+// addToCart adds an item to cart
 func addToCart(w http.ResponseWriter, r *http.Request) {
 	atomic.AddInt64(&totalWriteOperations, 1)
 	
@@ -496,7 +801,6 @@ func addToCart(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	
-	// Get product to verify it exists and get price
 	val, ok := productStore.Load(req.ProductID)
 	if !ok {
 		w.Header().Set("Content-Type", "application/json")
@@ -533,7 +837,6 @@ func addToCart(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	
-	// Check if item already in cart
 	found := false
 	for i, item := range cart.Items {
 		if item.ProductID == req.ProductID {
@@ -551,14 +854,12 @@ func addToCart(w http.ResponseWriter, r *http.Request) {
 		})
 	}
 	
-	// Recalculate total
 	cart.Total = 0
 	for _, item := range cart.Items {
 		cart.Total += item.Price * float64(item.Quantity)
 	}
 	cart.UpdatedAt = time.Now().Format(time.RFC3339)
 	
-	// Save cart
 	if useDynamoDB {
 		if err := saveCartToDynamoDB(r.Context(), cart); err != nil {
 			log.Printf("Error saving cart: %v", err)
@@ -627,9 +928,7 @@ func updateCartItem(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	
-	// Update or remove item
 	if req.Quantity <= 0 {
-		// Remove item
 		newItems := []CartItem{}
 		for _, item := range cart.Items {
 			if item.ProductID != id {
@@ -638,7 +937,6 @@ func updateCartItem(w http.ResponseWriter, r *http.Request) {
 		}
 		cart.Items = newItems
 	} else {
-		// Update quantity
 		found := false
 		for i, item := range cart.Items {
 			if item.ProductID == id {
@@ -655,14 +953,12 @@ func updateCartItem(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	
-	// Recalculate total
 	cart.Total = 0
 	for _, item := range cart.Items {
 		cart.Total += item.Price * float64(item.Quantity)
 	}
 	cart.UpdatedAt = time.Now().Format(time.RFC3339)
 	
-	// Save cart
 	if useDynamoDB {
 		if err := saveCartToDynamoDB(r.Context(), cart); err != nil {
 			log.Printf("Error saving cart: %v", err)
@@ -713,7 +1009,6 @@ func checkout(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	
-	// Create order
 	orderID := fmt.Sprintf("ORD-%s-%d", userID, time.Now().UnixNano())
 	order := Order{
 		OrderID:   orderID,
@@ -724,7 +1019,6 @@ func checkout(w http.ResponseWriter, r *http.Request) {
 		CreatedAt: time.Now().Format(time.RFC3339),
 	}
 	
-	// Save order and clear cart
 	if useDynamoDB {
 		if err := saveOrderToDynamoDB(r.Context(), &order); err != nil {
 			log.Printf("Error saving order: %v", err)
@@ -786,21 +1080,25 @@ func getOrder(w http.ResponseWriter, r *http.Request) {
 }
 
 func main() {
-	// Initialize DynamoDB client
+	// Initialize clients
 	initDynamoDB()
+	initRedis()
 	
-	// Initialize 100,000 products at startup (in-memory for fast search)
+	// Initialize 100,000 products at startup
 	initializeProducts()
 	
 	router := mux.NewRouter()
 
 	// READ endpoints
 	router.HandleFunc("/products/search", searchProducts).Methods("GET")
+	router.HandleFunc("/products/hot", getHotProducts).Methods("GET")
 	router.HandleFunc("/products/{id}", getProduct).Methods("GET")
+	router.HandleFunc("/products/{id}/compare", compareProductLatency).Methods("GET")
 	router.HandleFunc("/cart/{userId}", getCart).Methods("GET")
 	router.HandleFunc("/orders/{orderId}", getOrder).Methods("GET")
 	
 	// WRITE endpoints
+	router.HandleFunc("/products/{id}/hot", markProductHot).Methods("POST")
 	router.HandleFunc("/cart/{userId}/items", addToCart).Methods("POST")
 	router.HandleFunc("/cart/{userId}/items/{productId}", updateCartItem).Methods("PUT")
 	router.HandleFunc("/cart/{userId}/checkout", checkout).Methods("POST")
@@ -812,8 +1110,9 @@ func main() {
 
 	port := ":8080"
 	log.Printf("🚀 Starting E-Commerce API server on port %s...", port)
-	log.Printf("📦 Storage: DynamoDB=%v", useDynamoDB)
-	log.Printf("📖 READ endpoints: /products/search, /products/{id}, /cart/{userId}, /orders/{orderId}")
-	log.Printf("✍️  WRITE endpoints: /cart/{userId}/items (POST), /cart/{userId}/items/{productId} (PUT), /cart/{userId}/checkout (POST)")
+	log.Printf("📦 Storage: DynamoDB=%v, Redis=%v", useDynamoDB, redisEnabled)
+	log.Printf("📖 READ endpoints: /products/search, /products/hot, /products/{id}, /products/{id}/compare")
+	log.Printf("🔥 HOT PRODUCT endpoints: POST /products/{id}/hot, GET /products/hot")
+	log.Printf("✍️  WRITE endpoints: /cart/{userId}/items, /cart/{userId}/checkout")
 	log.Fatal(http.ListenAndServe(port, router))
 }

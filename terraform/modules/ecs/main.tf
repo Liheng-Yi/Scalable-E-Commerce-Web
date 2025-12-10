@@ -40,6 +40,10 @@ resource "aws_ecs_task_definition" "this" {
       {
         name  = "DYNAMODB_ORDERS_TABLE"
         value = var.dynamodb_orders_table
+      },
+      {
+        name  = "REDIS_ENDPOINT"
+        value = var.redis_endpoint
       }
     ]
 

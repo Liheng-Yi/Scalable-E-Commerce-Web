@@ -43,3 +43,9 @@ output "dynamodb_orders_table" {
   description = "DynamoDB orders table name"
   value       = module.dynamodb.orders_table_name
 }
+
+# Redis Outputs
+output "redis_endpoint" {
+  description = "Redis endpoint for hot product caching"
+  value       = module.elasticache.redis_connection_string
+}

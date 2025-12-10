@@ -122,3 +122,10 @@ variable "dynamodb_orders_table" {
   type        = string
   description = "Name of the DynamoDB orders table"
 }
+
+# Redis Configuration
+variable "redis_endpoint" {
+  type        = string
+  description = "Redis endpoint (host:port)"
+  default     = ""
+}

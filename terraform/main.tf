@@ -1,4 +1,4 @@
-# Wire together five focused modules: network, ecr, logging, dynamodb, ecs.
+# Wire together six focused modules: network, ecr, logging, dynamodb, elasticache, ecs.
 
 module "network" {
   source         = "./modules/network"
@@ -21,6 +21,15 @@ module "dynamodb" {
   source       = "./modules/dynamodb"
   service_name = var.service_name
   environment  = var.environment
+}
+
+module "elasticache" {
+  source                 = "./modules/elasticache"
+  service_name           = var.service_name
+  vpc_id                 = module.network.vpc_id
+  subnet_ids             = module.network.subnet_ids
+  ecs_security_group_ids = [module.network.security_group_id]
+  environment            = var.environment
 }
 
 # Reuse an existing IAM role for ECS tasks
@@ -54,6 +63,9 @@ module "ecs" {
   dynamodb_products_table = module.dynamodb.products_table_name
   dynamodb_carts_table    = module.dynamodb.carts_table_name
   dynamodb_orders_table   = module.dynamodb.orders_table_name
+  
+  # Redis Configuration
+  redis_endpoint = module.elasticache.redis_connection_string
 }
 
 // Build & push the Go app image into ECR
