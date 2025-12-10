@@ -106,3 +106,19 @@ variable "scale_out_cooldown" {
   default     = 300
   description = "Cooldown period (seconds) before scaling out"
 }
+
+# DynamoDB Table Names
+variable "dynamodb_products_table" {
+  type        = string
+  description = "Name of the DynamoDB products table"
+}
+
+variable "dynamodb_carts_table" {
+  type        = string
+  description = "Name of the DynamoDB carts table"
+}
+
+variable "dynamodb_orders_table" {
+  type        = string
+  description = "Name of the DynamoDB orders table"
+}

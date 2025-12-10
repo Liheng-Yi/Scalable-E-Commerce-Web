@@ -62,3 +62,10 @@ variable "scale_out_cooldown" {
   default     = 300
   description = "Seconds to wait before scaling out"
 }
+
+# Environment name for resource tagging
+variable "environment" {
+  type        = string
+  default     = "dev"
+  description = "Environment name (dev, staging, prod)"
+}

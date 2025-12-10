@@ -1,4 +1,4 @@
-# Wire together four focused modules: network, ecr, logging, ecs.
+# Wire together five focused modules: network, ecr, logging, dynamodb, ecs.
 
 module "network" {
   source         = "./modules/network"
@@ -15,6 +15,12 @@ module "logging" {
   source            = "./modules/logging"
   service_name      = var.service_name
   retention_in_days = var.log_retention_days
+}
+
+module "dynamodb" {
+  source       = "./modules/dynamodb"
+  service_name = var.service_name
+  environment  = var.environment
 }
 
 # Reuse an existing IAM role for ECS tasks
@@ -43,6 +49,11 @@ module "ecs" {
   memory_target_value    = var.memory_target_value
   scale_in_cooldown      = var.scale_in_cooldown
   scale_out_cooldown     = var.scale_out_cooldown
+  
+  # DynamoDB Table Names
+  dynamodb_products_table = module.dynamodb.products_table_name
+  dynamodb_carts_table    = module.dynamodb.carts_table_name
+  dynamodb_orders_table   = module.dynamodb.orders_table_name
 }
 
 // Build & push the Go app image into ECR

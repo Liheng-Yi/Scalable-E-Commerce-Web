@@ -27,3 +27,19 @@ output "aws_region" {
   description = "AWS region"
   value       = var.aws_region
 }
+
+# DynamoDB Table Outputs
+output "dynamodb_products_table" {
+  description = "DynamoDB products table name"
+  value       = module.dynamodb.products_table_name
+}
+
+output "dynamodb_carts_table" {
+  description = "DynamoDB carts table name"
+  value       = module.dynamodb.carts_table_name
+}
+
+output "dynamodb_orders_table" {
+  description = "DynamoDB orders table name"
+  value       = module.dynamodb.orders_table_name
+}

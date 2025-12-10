@@ -24,6 +24,25 @@ resource "aws_ecs_task_definition" "this" {
       protocol      = "tcp"
     }]
 
+    environment = [
+      {
+        name  = "AWS_REGION"
+        value = var.region
+      },
+      {
+        name  = "DYNAMODB_PRODUCTS_TABLE"
+        value = var.dynamodb_products_table
+      },
+      {
+        name  = "DYNAMODB_CARTS_TABLE"
+        value = var.dynamodb_carts_table
+      },
+      {
+        name  = "DYNAMODB_ORDERS_TABLE"
+        value = var.dynamodb_orders_table
+      }
+    ]
+
     logConfiguration = {
       logDriver = "awslogs"
       options = {
