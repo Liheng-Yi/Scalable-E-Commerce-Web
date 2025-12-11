@@ -1,36 +1,71 @@
-# E-commerce Product API
+# Scalable E-Commerce Web System
 
-A simple Go-based REST API for managing products in an online store. This implementation follows the OpenAPI 3.0.3 specification provided in `api.yaml`.
+> **A distributed e-commerce platform built to explore scalability, fault tolerance, and caching strategies under real-world conditions.**
+
+---
+
+## Why I Built This
+
+Modern e-commerce platforms face intense challenges: flash sales that spike traffic 100x, database failures that can't disrupt checkout, and latency requirements measured in milliseconds. I wanted to go beyond textbook definitions and **actually build and break** a system to understand how scalability and resilience work in practice.
+
+This project is a hands-on exploration of:
+- **Horizontal Scaling** — How does an API layer behave under increasing load? At what point does it buckle?
+- **Caching Strategies** — Redis vs. DynamoDB: how much latency can we shave off for hot products?
+- **Failure Recovery** — Circuit breakers, retry patterns with exponential backoff — do they actually save you when things go wrong?
+- **Performance Benchmarking** — Real numbers from Locust load tests, not just theory.
+
+---
+
+## Architecture Overview
+
+```
+                                    ┌─────────────────┐
+                                    │   CloudWatch    │
+                                    │   Monitoring    │
+                                    └────────┬────────┘
+                                             │
+┌──────────┐     ┌─────────────┐     ┌───────┴───────┐     ┌─────────────┐
+│  Locust  │────▶│    ALB      │────▶│   ECS Fargate │────▶│  DynamoDB   │
+│  (Load)  │     │ (Load Bal.) │     │   (Go API)    │     │  (Storage)  │
+└──────────┘     └─────────────┘     └───────┬───────┘     └─────────────┘
+                                             │
+                                     ┌───────┴───────┐
+                                     │  ElastiCache  │
+                                     │   (Redis)     │
+                                     └───────────────┘
+```
+
+**Tech Stack:**
+- **API Service:** Go with Gorilla Mux — handles product browsing, cart, and checkout
+- **Database:** AWS DynamoDB — stores products, carts, and orders
+- **Cache:** AWS ElastiCache (Redis) — caches hot products for sub-millisecond reads
+- **Infrastructure:** Terraform + ECS Fargate — fully containerized, auto-scaling deployment
+- **Load Testing:** Locust — simulates realistic user traffic patterns
+
+---
+
+## Scalability Experiments
+
+| Experiment | Goal | How |
+|------------|------|-----|
+| **Load Test** | Measure throughput & latency under stress | Locust simulating 100→1000+ concurrent users |
+| **Cache Comparison** | Quantify Redis speedup | Toggle caching on/off, compare p50/p95 latencies |
+| **Failure Recovery** | Validate resilience patterns | Inject failures, observe circuit breaker behavior |
+| **Hot Product Test** | Optimize for popular items | Pre-warm Redis with trending products, benchmark |
+
+---
 
 ## Features
 
-- **GET /products/{productId}** - Retrieve product details by ID
-- **POST /products/{productId}/details** - Create or update product information
-- In-memory storage with thread-safe operations
-- Full input validation according to OpenAPI specification
-- Proper HTTP status codes and error responses
-- Docker containerization support
+- **GET /products/{productId}** — Retrieve product details by ID
+- **POST /products/{productId}/details** — Create or update product information
+- **Shopping Cart API** — Add items, update quantities, checkout flow
+- **Order Processing** — Asynchronous order fulfillment
+- **Resilience Patterns** — Circuit breakers, retry with exponential backoff
+- **Real-time Monitoring** — CloudWatch metrics and logging
+- **Docker + Terraform** — One-command deployment to AWS
 
-## Product Schema
-
-```json
-{
-  "product_id": 12345,
-  "sku": "ABC-123-XYZ",
-  "manufacturer": "Acme Corporation",
-  "category_id": 456,
-  "weight": 1250,
-  "some_other_id": 789
-}
-```
-
-### Field Constraints
-- `product_id`: integer, minimum 1
-- `sku`: string, 1-100 characters
-- `manufacturer`: string, 1-200 characters
-- `category_id`: integer, minimum 1
-- `weight`: integer, minimum 0 (in grams)
-- `some_other_id`: integer, minimum 1
+---
 
 ## Prerequisites
 
@@ -41,9 +76,10 @@ A simple Go-based REST API for managing products in an online store. This implem
 
 ### Local Development
 
-1. Clone the repository and navigate to the week5 directory:
+1. Clone the repository:
 ```bash
-cd week5
+git clone https://github.com/Liheng-Yi/Scalable-E-Commerce-Web.git
+cd Scalable-E-Commerce-Web
 ```
 
 2. Download dependencies:
@@ -70,145 +106,6 @@ docker build -t product-api .
 docker run -p 8080:8080 product-api
 ```
 
-## API Examples
-
-### Health Check
-
-Check if the server is running:
-
-```bash
-curl http://localhost:8080/health
-```
-
-**Response:**
-```json
-{
-  "status": "healthy"
-}
-```
-
-### Create/Update a Product
-
-Add product details (note: product_id in path must match product_id in body):
-
-```bash
-curl -X POST http://localhost:8080/products/12345/details \
-  -H "Content-Type: application/json" \
-  -d '{
-    "product_id": 12345,
-    "sku": "ABC-123-XYZ",
-    "manufacturer": "Acme Corporation",
-    "category_id": 456,
-    "weight": 1250,
-    "some_other_id": 789
-  }'
-```
-
-**Success Response:** HTTP 204 No Content
-
-**Error Response Example (400 Bad Request):**
-```json
-{
-  "error": "INVALID_INPUT",
-  "message": "Invalid product data",
-  "details": "sku must be between 1 and 100 characters"
-}
-```
-
-### Get Product by ID
-
-Retrieve a product's details:
-
-```bash
-curl http://localhost:8080/products/12345
-```
-
-**Success Response (200 OK):**
-```json
-{
-  "product_id": 12345,
-  "sku": "ABC-123-XYZ",
-  "manufacturer": "Acme Corporation",
-  "category_id": 456,
-  "weight": 1250,
-  "some_other_id": 789
-}
-```
-
-**Error Response (404 Not Found):**
-```json
-{
-  "error": "NOT_FOUND",
-  "message": "Product not found",
-  "details": "Product with ID 12345 does not exist"
-}
-```
-
-### More Examples
-
-#### Invalid Product ID (Non-numeric)
-```bash
-curl http://localhost:8080/products/abc
-```
-
-**Response (400 Bad Request):**
-```json
-{
-  "error": "INVALID_INPUT",
-  "message": "Invalid product ID",
-  "details": "Product ID must be a positive integer"
-}
-```
-
-#### Invalid Product ID (Zero or Negative)
-```bash
-curl http://localhost:8080/products/0
-```
-
-**Response (400 Bad Request):**
-```json
-{
-  "error": "INVALID_INPUT",
-  "message": "Invalid product ID",
-  "details": "Product ID must be a positive integer"
-}
-```
-
-#### Product ID Mismatch
-```bash
-curl -X POST http://localhost:8080/products/12345/details \
-  -H "Content-Type: application/json" \
-  -d '{
-    "product_id": 99999,
-    "sku": "ABC-123-XYZ",
-    "manufacturer": "Acme Corporation",
-    "category_id": 456,
-    "weight": 1250,
-    "some_other_id": 789
-  }'
-```
-
-**Response (400 Bad Request):**
-```json
-{
-  "error": "INVALID_INPUT",
-  "message": "Product ID mismatch",
-  "details": "Product ID in path (12345) does not match product ID in body (99999)"
-}
-```
-
-## HTTP Status Codes
-
-The API uses standard HTTP status codes:
-
-- **200 OK** - Successful GET request
-- **204 No Content** - Successful POST request
-- **400 Bad Request** - Invalid input data
-- **404 Not Found** - Product not found
-- **500 Internal Server Error** - Server error
-
-Learn more about HTTP status codes at [HTTP Cats](https://http.cat/)! 🐱
-
 ## Automated Testing
 
 ### Using the Test Script
@@ -225,45 +122,6 @@ If you have `jq` installed:
 ```bash
 chmod +x test_api.sh
 ./test_api.sh
-```
-
-To install `jq`:
-- **Windows (Git Bash)**: Download from https://jqlang.github.io/jq/download/
-- **macOS**: `brew install jq`
-- **Linux**: `sudo apt-get install jq` or `sudo yum install jq`
-
-## Testing with Postman
-
-You can import these curl commands into Postman for easier testing:
-
-1. Open Postman
-2. Click "Import" → "Raw text"
-3. Paste any of the curl commands above
-4. Click "Import"
-
-Or import the included `Product_API.postman_collection.json` file directly into Postman.
-
-**The Postman collection includes automated test scripts!** See `POSTMAN_TESTING_GUIDE.md` for details on:
-- 40+ automated tests covering all scenarios
-- Running tests individually or as a collection
-- CI/CD integration with Newman
-- Understanding test results
-
-## Project Structure
-
-```
-week5/
-├── main.go                              # Main application code
-├── go.mod                               # Go module dependencies
-├── go.sum                               # Go dependency checksums
-├── Dockerfile                           # Docker container definition
-├── docker-compose.yml                   # Docker Compose configuration
-├── api.yaml                             # OpenAPI specification
-├── README.md                            # This file
-├── POSTMAN_TESTING_GUIDE.md             # Guide for automated testing
-├── Product_API.postman_collection.json  # Postman collection with tests
-├── test_api_simple.sh                   # Bash test script (no dependencies)
-└── .gitignore                           # Git ignore file
 ```
 
 ## Implementation Details
@@ -291,140 +149,3 @@ Recovery Test:  Request → Circuit HALF-OPEN → Test Request
                     ↓ (success)
 Recovered:      Request → Circuit CLOSED → Normal Flow
 ```
-
-**States:**
-| State | Description |
-|-------|-------------|
-| **CLOSED** | Normal operation - all requests flow through |
-| **OPEN** | Service failing - requests rejected immediately |
-| **HALF_OPEN** | Testing recovery after timeout period |
-
-**Configuration:**
-- Failure Threshold: 5 failures to open circuit
-- Success Threshold: 3 successes to close from half-open
-- Recovery Timeout: 30 seconds
-
-### Retry Pattern with Exponential Backoff
-
-Automatically retries failed operations with increasing delays.
-
-```
-Attempt 1 → Failure → Wait 100ms
-Attempt 2 → Failure → Wait 200ms (×2 backoff)
-Attempt 3 → Failure → Wait 400ms (×2 backoff)
-Attempt 4 → Success! ✓
-```
-
-**Configuration:**
-- Max Retries: 3 attempts
-- Initial Delay: 100ms
-- Max Delay: 5 seconds
-- Backoff Factor: 2.0 (exponential)
-- Jitter: Enabled (prevents thundering herd)
-
-### Resilience Endpoints
-
-```bash
-# View interactive demo and guide
-GET /resilience/demo
-
-# Check circuit breaker status
-GET /resilience/circuit-breakers
-
-# Simulate failures for testing
-POST /resilience/simulate/{service}  # service: dynamodb, redis, payment
-{
-    "enable": true,
-    "failure_rate": 0.8  # 80% failure rate (payment only)
-}
-
-# Reset circuit breaker
-POST /resilience/reset/{service}  # service: dynamodb, redis, payment, all
-
-# Test retry pattern
-POST /resilience/test-retry
-{
-    "fail_count": 2,
-    "max_retries": 3
-}
-```
-
-### Testing Failure Recovery
-
-**Step 1: Enable Payment Failures**
-```bash
-curl -X POST http://localhost:8080/resilience/simulate/payment \
-  -H "Content-Type: application/json" \
-  -d '{"enable": true, "failure_rate": 0.8}'
-```
-
-**Step 2: Make Checkout Request (observe retries)**
-```bash
-# First add item to cart
-curl -X POST http://localhost:8080/cart/user123/items \
-  -H "Content-Type: application/json" \
-  -d '{"product_id": 100, "quantity": 2}'
-
-# Checkout - watch retry pattern in action
-curl -X POST http://localhost:8080/cart/user123/checkout
-```
-
-**Step 3: Check Circuit Breaker Status**
-```bash
-curl http://localhost:8080/resilience/circuit-breakers
-```
-
-**Step 4: Reset and Disable**
-```bash
-# Reset circuit breaker
-curl -X POST http://localhost:8080/resilience/reset/payment
-
-# Disable failure simulation
-curl -X POST http://localhost:8080/resilience/simulate/payment \
-  -H "Content-Type: application/json" \
-  -d '{"enable": false}'
-```
-
-### Response Examples
-
-**Successful Checkout with Retry:**
-```json
-{
-  "order": {
-    "order_id": "ORD-user123-1699876543",
-    "status": "confirmed",
-    "total": 200.00
-  },
-  "payment": {
-    "transaction_id": "TXN-1699876543",
-    "status": "success"
-  },
-  "recovery_applied": true,
-  "recovery_details": "Payment succeeded after 3 attempts (retry pattern applied)"
-}
-```
-
-**Circuit Breaker Open:**
-```json
-{
-  "error": "Payment service temporarily unavailable",
-  "circuit_breaker": "open",
-  "retry_after_secs": 30
-}
-```
-
-## Future Enhancements
-
-This is a simple Product API implementation. Future versions could include:
-- Database persistence (PostgreSQL, MongoDB, etc.)
-- Authentication and authorization
-- Additional CRUD operations (DELETE, PUT)
-- Pagination for listing products
-- Search and filter capabilities
-- Integration with other services (Shopping Cart, Warehouse, Payments)
-
-## License
-
-MIT License
-
-
