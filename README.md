@@ -274,6 +274,145 @@ week5/
 - **RESTful Design**: Follows REST principles and HTTP standards
 - **Gorilla Mux Router**: Uses the popular Gorilla Mux for flexible routing
 
+## Failure Recovery - Circuit Breaker & Retry Patterns
+
+The API implements enterprise-grade failure recovery patterns to handle database and payment service failures gracefully.
+
+### Circuit Breaker Pattern
+
+Prevents cascading failures by temporarily stopping requests to failing services.
+
+```
+Normal Flow:    Request → Service → Response
+                    ↓
+After Failures: Request → Circuit OPEN → Immediate Rejection (503)
+                    ↓ (after timeout)
+Recovery Test:  Request → Circuit HALF-OPEN → Test Request
+                    ↓ (success)
+Recovered:      Request → Circuit CLOSED → Normal Flow
+```
+
+**States:**
+| State | Description |
+|-------|-------------|
+| **CLOSED** | Normal operation - all requests flow through |
+| **OPEN** | Service failing - requests rejected immediately |
+| **HALF_OPEN** | Testing recovery after timeout period |
+
+**Configuration:**
+- Failure Threshold: 5 failures to open circuit
+- Success Threshold: 3 successes to close from half-open
+- Recovery Timeout: 30 seconds
+
+### Retry Pattern with Exponential Backoff
+
+Automatically retries failed operations with increasing delays.
+
+```
+Attempt 1 → Failure → Wait 100ms
+Attempt 2 → Failure → Wait 200ms (×2 backoff)
+Attempt 3 → Failure → Wait 400ms (×2 backoff)
+Attempt 4 → Success! ✓
+```
+
+**Configuration:**
+- Max Retries: 3 attempts
+- Initial Delay: 100ms
+- Max Delay: 5 seconds
+- Backoff Factor: 2.0 (exponential)
+- Jitter: Enabled (prevents thundering herd)
+
+### Resilience Endpoints
+
+```bash
+# View interactive demo and guide
+GET /resilience/demo
+
+# Check circuit breaker status
+GET /resilience/circuit-breakers
+
+# Simulate failures for testing
+POST /resilience/simulate/{service}  # service: dynamodb, redis, payment
+{
+    "enable": true,
+    "failure_rate": 0.8  # 80% failure rate (payment only)
+}
+
+# Reset circuit breaker
+POST /resilience/reset/{service}  # service: dynamodb, redis, payment, all
+
+# Test retry pattern
+POST /resilience/test-retry
+{
+    "fail_count": 2,
+    "max_retries": 3
+}
+```
+
+### Testing Failure Recovery
+
+**Step 1: Enable Payment Failures**
+```bash
+curl -X POST http://localhost:8080/resilience/simulate/payment \
+  -H "Content-Type: application/json" \
+  -d '{"enable": true, "failure_rate": 0.8}'
+```
+
+**Step 2: Make Checkout Request (observe retries)**
+```bash
+# First add item to cart
+curl -X POST http://localhost:8080/cart/user123/items \
+  -H "Content-Type: application/json" \
+  -d '{"product_id": 100, "quantity": 2}'
+
+# Checkout - watch retry pattern in action
+curl -X POST http://localhost:8080/cart/user123/checkout
+```
+
+**Step 3: Check Circuit Breaker Status**
+```bash
+curl http://localhost:8080/resilience/circuit-breakers
+```
+
+**Step 4: Reset and Disable**
+```bash
+# Reset circuit breaker
+curl -X POST http://localhost:8080/resilience/reset/payment
+
+# Disable failure simulation
+curl -X POST http://localhost:8080/resilience/simulate/payment \
+  -H "Content-Type: application/json" \
+  -d '{"enable": false}'
+```
+
+### Response Examples
+
+**Successful Checkout with Retry:**
+```json
+{
+  "order": {
+    "order_id": "ORD-user123-1699876543",
+    "status": "confirmed",
+    "total": 200.00
+  },
+  "payment": {
+    "transaction_id": "TXN-1699876543",
+    "status": "success"
+  },
+  "recovery_applied": true,
+  "recovery_details": "Payment succeeded after 3 attempts (retry pattern applied)"
+}
+```
+
+**Circuit Breaker Open:**
+```json
+{
+  "error": "Payment service temporarily unavailable",
+  "circuit_breaker": "open",
+  "retry_after_secs": 30
+}
+```
+
 ## Future Enhancements
 
 This is a simple Product API implementation. Future versions could include:
